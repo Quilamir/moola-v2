@@ -8,6 +8,7 @@ build/
 .vscode
 .idea
 /types
+liquidationBotHistoryData.json
 
 deployed-contracts.json
 
