@@ -24,7 +24,9 @@ const localnode = argv.CELO_BOT_NODE || process.env.CELO_BOT_NODE || 'https://fo
 const user = argv.CELO_BOT_ADDRESS || process.env.CELO_BOT_ADDRESS
 const pk = argv.CELO_BOT_PK || process.env.CELO_BOT_PK
 const loopDelay = argv.CELO_BOT_LOOP_DELAY || process.env.CELO_BOT_LOOP_DELAY || 60000
-const swapperRouter = argv.CELO_BOT_SWAPPER || process.env.CELO_BOT_SWAPPER
+const swapThreshold = argv.CELO_BOT_UBE_THRESHOLD || process.env.CELO_BOT_UBE_THRESHOLD || 1
+const maxBalance = argv.CELO_BOT_MAX_BALANCE || process.env.CELO_BOT_MAX_BALANCE
+const dirName = argv.CELO_BOT_DATA_DIR || process.env.CELO_BOT_DATA_DIR || __dirname
 
 // make sure we have what is needed
 if (!pk || !user) {
@@ -129,10 +131,11 @@ async function start() {
   //    lastBlock,
   //    users
   //  }
-  const filename = 'liquidationBotHistoryData.json'
+  const dataFilename = path.join(dirName, 'liquidationBotHistoryData.json')
   let filedata
+  
   try {
-    filedata = require(path.join(__dirname, filename))
+    filedata = require(dataFilename)
   } catch (e) {
     console.log('No historical data')
   }
@@ -182,7 +185,7 @@ async function start() {
       console.log(`${riskiestUser[0]} ${BN(print(riskiestUser[1].healthFactor)).toFixed(3)} ${BN(print(riskiestUser[1].totalCollateralETH)).toFixed(3)}`)
     }
 
-    // getting all the user with health factor less than 1
+    // getting all the users with health factor less than 1
     const risky = usersData.filter(([address, data]) => BN(data.healthFactor).dividedBy(ether).lt(BN(1))).map(el => el[0])
     console.log(`found ${risky.length} users to run`)
 
@@ -197,7 +200,7 @@ async function start() {
         if (token === 'celo') {
           rates["celo"] = BN(ether)
         } else {
-          // getting rates from sushiswap as a reference to check which borrow positions later on
+          // getting rates from sushiswap as a reference to check borrow positions later on
           rates[token] = BN((await sushiSwap.methods.getAmountsOut(ether, [CELO.options.address, wrappedEth, tokens[token].options.address]).call())[2])
         }
       })
@@ -226,9 +229,10 @@ async function start() {
       const borrowToken = biggestBorrow[0].toLowerCase()
 
       try {
+        let gasprice
         try {
           // estimating gas cost for liquidation just as a precaution
-          await lendingPool.methods.liquidationCall(tokens[collateralToken].options.address, tokens[borrowToken].options.address, riskUser, await tokens[borrowToken].methods.balanceOf(user).call(), false).estimateGas({from: user, gas: 2000000})
+          gasprice = await lendingPool.methods.liquidationCall(tokens[collateralToken].options.address, tokens[borrowToken].options.address, riskUser, await tokens[borrowToken].methods.balanceOf(user).call(), false).estimateGas({from: user, gas: 2000000})
         } catch (err) {
           console.error(`[${riskUser}] Cannot estimate liquidate ${collateralToken}->${borrowToken}`, err.message)
           throw err
@@ -239,7 +243,14 @@ async function start() {
         console.log(`Balance of ${collateralToken} Before Liquidation: ${print(collateralBefore)}`)
 
         // liquidating
-        await lendingPool.methods.liquidationCall(tokens[collateralToken].options.address, tokens[borrowToken].options.address, riskUser, await tokens[borrowToken].methods.balanceOf(user).call(), false).send({from: user, gas: 2000000})
+        // we need to set a limit of how much to liquidate (in case of very large liquidation)
+        let userBalance = await tokens[borrowToken].methods.balanceOf(user).call()
+        if (maxBalance && userBalance > maxBalance) {
+          userBalance = maxBalance
+        }
+
+        // liquidating
+        await lendingPool.methods.liquidationCall(tokens[collateralToken].options.address, tokens[borrowToken].options.address, riskUser, userBalance, false).send({from: user, gas: gasprice})
 
         // calculating profit
         const profit = BN((await tokens[collateralToken].methods.balanceOf(user).call())).minus(collateralBefore)
@@ -260,32 +271,69 @@ async function start() {
           // get ubeswap price
           // ubeSwap uses the mctoken instead of the ctoken in their pools so we need to take that into account here
           // also we will need to "deposit" the collateral token into moola before doing the final swap
+
+          // checking if the m version exists
+          let ubeSwapCollateral = tokens[collateralToken]
+          let ubeSwapBorrow = tokens[borrowToken]
+          let swapPath
+
+          if (collateralToken !== 'celo' && tokens['m'+collateralToken]) {
+            ubeSwapCollateral = tokens['m'+collateralToken]
+          }
+
+          if (borrowToken !== 'celo' && tokens['m'+borrowToken]) {
+            ubeSwapBorrow = tokens['m'+borrowToken]
+          }
+
+          // getting price from ubeswap
+          let ubeSwapPath = [ubeSwapCollateral.options.address, ubeSwapBorrow.options.address]
+
+          const ubeSwapPrice = BN((await ubeSwap.methods.getAmountsOut(profit, ubeSwapPath).call())[ubeSwapPath.length - 1])
           
           // get sushiswap price
-
-          // set swap path
-          let swapPath = [tokens[collateralToken].options.address, tokens[borrowToken].options.address]
+          let sushiSwapPath = [tokens[collateralToken].options.address, tokens[borrowToken].options.address]
 
           // for swapping celo we need to go through wrapped ETH
           if (borrowToken === 'celo' || collateralToken === 'celo') {
-            swapPath = [tokens[collateralToken].options.address, wrappedEth, tokens[borrowToken].options.address]
+            sushiSwapPath = [tokens[collateralToken].options.address, wrappedEth, tokens[borrowToken].options.address]
+          }
+
+          const sushiSwapPrice = BN((await sushiSwap.methods.getAmountsOut(profit, sushiSwapPath).call())[sushiSwapPath.length - 1])
+
+          // check which is better
+          if (ubeSwapPrice.lt(sushiSwapPrice)) {
+            const difference = sushiSwapPrice.minus(ubeSwapPrice)
+            const percentage = sushiSwapPrice.multipliedBy(100 / swapThreshold)
+
+            if (difference.lt(percentage)) {
+              swapPath = sushiSwapPath
+              swapper = sushiSwap
+            }
+          } else {
+            swapPath = ubeSwapPath
+            swapper = ubeSwap
+          }
+          
+          if (swapper === ubeSwap) {
+            // we need to deposit the token into moola before swapping it
+            const depositGas = await lendingPool.methods.deposit(tokens[collateralToken].options.address, profit, user, 0).estimateGas({from: user, gas: 2000000})
+            const receipt = await lendingPool.methods.deposit(tokens[collateralToken].options.address, profit, user, 0).send({from: user, gas: depositGas})
+            console.log(receipt)
           }
 
           // swap the liquidated asset
           await retry(async () => {
-            // getting swap rate
-            const amountOut = BN((await swapper.methods.getAmountsOut(profit, swapPath).call())[swapPath.length - 1])
-
             // estimate gas for the swap as a precaution
+            let gasprice
             try {
-              await swapper.methods.swapExactTokensForTokens(profit, amountOut.multipliedBy(BN(999)).dividedBy(BN(1000)).toFixed(0), swapPath, user, nowSeconds() + 300).estimateGas({from: user, gas: 2000000})
+              gasprice = await swapper.methods.swapExactTokensForTokens(profit, amountOut.multipliedBy(BN(999)).dividedBy(BN(1000)).toFixed(0), swapPath, user, nowSeconds() + 300).estimateGas({from: user, gas: 2000000})
             } catch (err) {
               console.error(`[${riskUser}] Cannot estimate swap ${collateralToken}->${borrowToken}`, err.message)
               throw err
             }
 
             // swap
-            const receipt = await swapper.methods.swapExactTokensForTokens(profit, amountOut.multipliedBy(BN(999)).dividedBy(BN(1000)).toFixed(0), swapPath, user, nowSeconds() + 300).send({from: user, gas: 2000000})
+            const receipt = await swapper.methods.swapExactTokensForTokens(profit, amountOut.multipliedBy(BN(999)).dividedBy(BN(1000)).toFixed(0), swapPath, user, nowSeconds() + 300).send({from: user, gas: gasprice})
             if (!receipt.status) {
               throw Error('Swap failed')
             }
@@ -301,7 +349,7 @@ async function start() {
     }
     
     // we should write the last block and its events to the localstorage here.
-    fs.writeFileSync(filename,JSON.stringify({
+    fs.writeFileSync(dataFilename,JSON.stringify({
       lastBlock: parsedToBlock,
       users
     }))
