@@ -8,11 +8,11 @@
 const fs = require('fs')
 const path = require('path')
 const { newKit } = require('@celo/contractkit')
-const LendingPoolAddressesProvider = require('./abi/LendingPoolAddressProvider.json')
-const LendingPool = require('./abi/LendingPool.json')
-const Uniswap = require('./abi/Uniswap.json')
-const DataProvider = require('./abi/MoolaProtocolDataProvider.json')
-const MToken = require('./abi/MToken.json')
+const LendingPoolAddressesProvider = require('../abi/LendingPoolAddressProvider.json')
+const LendingPool = require('../abi/LendingPool.json')
+const Uniswap = require('../abi/Uniswap.json')
+const DataProvider = require('../abi/MoolaProtocolDataProvider.json')
+const MToken = require('../abi/MToken.json')
 const BigNumber = require('bignumber.js')
 const Promise = require('bluebird')
 const yargs = require('yargs/yargs')
@@ -30,7 +30,7 @@ const dirName = argv.CELO_BOT_DATA_DIR || process.env.CELO_BOT_DATA_DIR || __dir
 
 // make sure we have what is needed
 if (!pk || !user) {
-  throw new Error('Miising parameters, make sure you have CELO_BOT_NODE, CELO_BOT_ADDRESS, CELO_BOT_PK set correctly either in environment or cli')
+  throw new Error('Miising parameters, make sure you have CELO_BOT_ADDRESS, CELO_BOT_PK set correctly either in environment or cli')
 }
 
 // some primitives
@@ -65,7 +65,7 @@ async function start() {
   // setting up the kit and tokens
   // this list will grow as more tokens are added to Moola
   // consider getting this list from an online source in the future
-  kit = newKit('https://forno.celo.org')
+  kit = newKit(localnode)
   const addressProvider = new kit.web3.eth.Contract(LendingPoolAddressesProvider, '0xD1088091A174d33412a968Fa34Cb67131188B332')
   const cEUR = new kit.web3.eth.Contract(MToken, '0xD8763CBa276a3738E6DE85b4b3bF5FDed6D6cA73')
   const cUSD = new kit.web3.eth.Contract(MToken, '0x765DE816845861e75A25fCA122bb6898B8B1282a')
@@ -99,14 +99,14 @@ async function start() {
   const sushiSwapRouter = '0x1421bDe4B10e8dd459b3BCb598810B1337D56842'
   const ubeSwapRouter = '0xE3D8bd6Aed4F159bc8000a9cD47CffDb95F96121'
   const wrappedEth = '0xE919F65739c26a42616b7b8eedC6b5524d1e3aC4'
-  const ubeSwap = new kit.web3.eth.Contract(Uniswap, ubeSwapRouter)
-  const sushiSwap = new kit.web3.eth.Contract(Uniswap, sushiSwapRouter)
+  const ubeSwap = new eth.Contract(Uniswap, ubeSwapRouter)
+  const sushiSwap = new eth.Contract(Uniswap, sushiSwapRouter)
   const swappers = {
     ubeSwap,
     sushiSwap
   }
 
-  // approving spend of the tokens (both moola and uniswap)
+  // approving spend of the tokens (both moola and swappers)
   await Promise.map(tokenNames, async (token) => {
     console.log(`Checking ${token} for approval`)
     if ((await tokens[token].methods.allowance(user, lendingPool.options.address).call()).length < 30) {
@@ -126,23 +126,15 @@ async function start() {
   let users = {}
 
   // if we have localstorage data we need to parse it here and find the last block that was proccessed
-  // data structure:
-  // {
-  //    lastBlock,
-  //    users
-  //  }
   const dataFilename = path.join(dirName, 'liquidationBotHistoryData.json')
   let filedata
   
   try {
     filedata = require(dataFilename)
-  } catch (e) {
-    console.log('No historical data')
-  }
-
-  if (filedata) {
     fromBlock = filedata.lastBlock
     users = filedata.users
+  } catch (e) {
+    console.log('No historical data')
   }
 
   // starting the bot loop
@@ -229,10 +221,10 @@ async function start() {
       const borrowToken = biggestBorrow[0].toLowerCase()
 
       try {
-        let gasprice
+        let liquidationGasPrice
         try {
           // estimating gas cost for liquidation just as a precaution
-          gasprice = await lendingPool.methods.liquidationCall(tokens[collateralToken].options.address, tokens[borrowToken].options.address, riskUser, await tokens[borrowToken].methods.balanceOf(user).call(), false).estimateGas({from: user, gas: 2000000})
+          liquidationGasPrice = await lendingPool.methods.liquidationCall(tokens[collateralToken].options.address, tokens[borrowToken].options.address, riskUser, await tokens[borrowToken].methods.balanceOf(user).call(), false).estimateGas({from: user, gas: 2000000})
         } catch (err) {
           console.error(`[${riskUser}] Cannot estimate liquidate ${collateralToken}->${borrowToken}`, err.message)
           throw err
@@ -250,7 +242,13 @@ async function start() {
         }
 
         // liquidating
-        await lendingPool.methods.liquidationCall(tokens[collateralToken].options.address, tokens[borrowToken].options.address, riskUser, userBalance, false).send({from: user, gas: gasprice})
+        try {
+          let liquidationReceipt = await lendingPool.methods.liquidationCall(tokens[collateralToken].options.address, tokens[borrowToken].options.address, riskUser, userBalance, false).send({from: user, gas: liquidationGasPrice})
+          console.log(liquidationReceipt)
+        } catch (err) {
+          console.error(`[${riskUser}] Cannot Liquidate ${collateralToken}->${borrowToken}`, err.message)
+          throw err
+        }
 
         // calculating profit
         const profit = BN((await tokens[collateralToken].methods.balanceOf(user).call())).minus(collateralBefore)
@@ -259,15 +257,16 @@ async function start() {
         console.log(`Profit: ${print(profit)}`)
         if (!profit.isPositive()) {
           console.error(`NO Profit!`)
+          // we need to decide if actually want to do the swap here, for now we are stopping the process
           throw new Error('No Profit')
         }
 
-        // here we need to decide which swapper to use
-        // in order to do this we need to get the prices from all the swapper providers
-        // for now we are supporting ubeSwap and sushiSwap
-
-        // setting up the swap in case the borrow token is not the same as collateral token
+        // checking if we need to do a swap
         if (collateralToken !== borrowToken) {
+          // here we need to decide which swapper to use
+          // in order to do this we need to get the prices from all the swapper providers
+          // for now we are supporting ubeSwap and sushiSwap
+
           // get ubeswap price
           // ubeSwap uses the mctoken instead of the ctoken in their pools so we need to take that into account here
           // also we will need to "deposit" the collateral token into moola before doing the final swap
@@ -278,32 +277,34 @@ async function start() {
           let swapPath
 
           if (collateralToken !== 'celo' && tokens['m'+collateralToken]) {
+            // switching to the mc token
             ubeSwapCollateral = tokens['m'+collateralToken]
           }
 
           if (borrowToken !== 'celo' && tokens['m'+borrowToken]) {
+            // switching to the mc token
             ubeSwapBorrow = tokens['m'+borrowToken]
           }
 
-          // getting price from ubeswap
+          // preparing ubeswap path
           let ubeSwapPath = [ubeSwapCollateral.options.address, ubeSwapBorrow.options.address]
-
+          // getting the price
           const ubeSwapPrice = BN((await ubeSwap.methods.getAmountsOut(profit, ubeSwapPath).call())[ubeSwapPath.length - 1])
           
-          // get sushiswap price
+          // preparing sushiswap path
           let sushiSwapPath = [tokens[collateralToken].options.address, tokens[borrowToken].options.address]
-
           // for swapping celo we need to go through wrapped ETH
           if (borrowToken === 'celo' || collateralToken === 'celo') {
             sushiSwapPath = [tokens[collateralToken].options.address, wrappedEth, tokens[borrowToken].options.address]
           }
-
+          // getting the price
           const sushiSwapPrice = BN((await sushiSwap.methods.getAmountsOut(profit, sushiSwapPath).call())[sushiSwapPath.length - 1])
 
           // check which is better
           if (ubeSwapPrice.lt(sushiSwapPrice)) {
+            // we are giving ubeSwap an advantage here up to a certain percentage
             const difference = sushiSwapPrice.minus(ubeSwapPrice)
-            const percentage = sushiSwapPrice.multipliedBy(100 / swapThreshold)
+            const percentage = sushiSwapPrice.multipliedBy(swapThreshold).dividedBy(100)
 
             if (difference.lt(percentage)) {
               swapPath = sushiSwapPath
@@ -315,10 +316,23 @@ async function start() {
           }
           
           if (swapper === ubeSwap) {
+            let depositGas
+            let depositReceipt
             // we need to deposit the token into moola before swapping it
-            const depositGas = await lendingPool.methods.deposit(tokens[collateralToken].options.address, profit, user, 0).estimateGas({from: user, gas: 2000000})
-            const receipt = await lendingPool.methods.deposit(tokens[collateralToken].options.address, profit, user, 0).send({from: user, gas: depositGas})
-            console.log(receipt)
+            try {
+              depositGas = await lendingPool.methods.deposit(tokens[collateralToken].options.address, profit, user, 0).estimateGas({from: user, gas: 2000000})
+            } catch (err) {
+              console.error(`Failed to estimate Deposit!!!`)
+              throw err
+            }
+
+            try {
+              depositReceipt = await lendingPool.methods.deposit(tokens[collateralToken].options.address, profit, user, 0).send({from: user, gas: depositGas})
+              console.log(depositReceipt)
+            } catch (err) {
+              console.error(`Failed to Deposit!!!`)
+              throw err
+            }
           }
 
           // swap the liquidated asset
@@ -333,8 +347,15 @@ async function start() {
             }
 
             // swap
-            const receipt = await swapper.methods.swapExactTokensForTokens(profit, amountOut.multipliedBy(BN(999)).dividedBy(BN(1000)).toFixed(0), swapPath, user, nowSeconds() + 300).send({from: user, gas: gasprice})
-            if (!receipt.status) {
+            let swapReceipt
+            try {
+              swapReceipt = await swapper.methods.swapExactTokensForTokens(profit, amountOut.multipliedBy(BN(999)).dividedBy(BN(1000)).toFixed(0), swapPath, user, nowSeconds() + 300).send({from: user, gas: gasprice})
+            } catch (err) {
+              console.error(`[${riskUser}] Swap Failed!!! ${collateralToken}->${borrowToken}`, err.message)
+              throw err
+            }
+
+            if (!swapReceipt.status) {
               throw Error('Swap failed')
             }
           })
