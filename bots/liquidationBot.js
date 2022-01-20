@@ -27,7 +27,7 @@ const user = argv.CELO_BOT_ADDRESS || process.env.CELO_BOT_ADDRESS
 const pk = argv.CELO_BOT_PK || process.env.CELO_BOT_PK
 const loopDelay = argv.CELO_BOT_LOOP_DELAY || process.env.CELO_BOT_LOOP_DELAY || 60000
 const swapThreshold = argv.CELO_BOT_UBE_THRESHOLD || process.env.CELO_BOT_UBE_THRESHOLD || 1
-const maxBalance = argv.CELO_BOT_MAX_BALANCE || process.env.CELO_BOT_MAX_BALANCEm || 0
+const maxBalance = argv.CELO_BOT_MAX_BALANCE || process.env.CELO_BOT_MAX_BALANCE || 0
 const dirName = argv.CELO_BOT_DATA_DIR || process.env.CELO_BOT_DATA_DIR || __dirname
 
 // make sure we have what is needed
@@ -246,6 +246,7 @@ async function start() {
         // liquidating
         // we need to set a limit of how much to liquidate (in case of very large liquidation)
         let userBalance = await tokens[borrowToken].methods.balanceOf(user).call()
+        // we need to figure out a good way to calculate max balance, as the number will be "worth" a different mount with each token TODO!
         if (maxBalance && userBalance > maxBalance) {
           userBalance = maxBalance
         }
