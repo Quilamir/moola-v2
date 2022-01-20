@@ -87,13 +87,24 @@ async function start() {
   const tokens = {
     celo: CELO,
     cusd: cUSD,
-    ceur: cEUR,
+    ceur: cEUR
+  }
+
+  const mctokens = {
     mceur: mcEUR,
     mcusd: mcUSD
   }
 
+  const allTokens = Object.assign(tokens, mctokens)
+
   // for ease of use later
   const tokenNames = Object.keys(tokens)
+
+  // for ease of use later
+  const mcTokenNames = Object.keys(mctokens)
+
+  // for ease of use later
+  const allTokenNames = Object.keys(allTokens)
   
   // adding the user account and private key to the kit
   kit.addAccount(pk)
@@ -110,15 +121,15 @@ async function start() {
   }
 
   // approving spend of the tokens (both moola and swappers)
-  await Promise.map(tokenNames, async (token) => {
+  await Promise.map(allTokenNames, async (token) => {
     console.log(`Checking ${token} for approval`)
-    if ((await tokens[token].methods.allowance(user, lendingPool.options.address).call()).length < 30) {
-      console.log('Approve Moola', (await tokens[token].methods.approve(lendingPool.options.address, maxUint256).send({from: user, gas: 2000000})).transactionHash)
+    if ((await allTokens[token].methods.allowance(user, lendingPool.options.address).call()).length < 30) {
+      console.log('Approve Moola', (await allTokens[token].methods.approve(lendingPool.options.address, maxUint256).send({from: user, gas: 2000000})).transactionHash)
     }
 
     await Promise.map(Object.keys(swappers), async (swapper) => {
-      if (await tokens[token].methods.allowance(user, swappers[swapper].options.address).call().length < 30) {
-        console.log(`Approve ${swapper}`, (await tokens[token].methods.approve(swappers[swapper].options.address, maxUint256).send({from: user, gas: 2000000})).transactionHash)
+      if (await allTokens[token].methods.allowance(user, swappers[swapper].options.address).call().length < 30) {
+        console.log(`Approve ${swapper}`, (await allTokens[token].methods.approve(swappers[swapper].options.address, maxUint256).send({from: user, gas: 2000000})).transactionHash)
       }
     })
   })
@@ -177,6 +188,7 @@ async function start() {
 
     // sorting to get riskiest on top
     const riskiest = usersData.sort(([a1, data1], [a2, data2]) => BN(data1.healthFactor).comparedTo(BN(data2.healthFactor)))
+    console.log(JSON.stringify(riskiest))
 
     // showing top 3 riskiest users (this is just for the logs)
     console.log(`Top 3 Riskiest users of ${riskiest.length}:`)
@@ -193,6 +205,7 @@ async function start() {
     for (let riskUser of risky) {
       console.log(`!!!!! liquidating user ${riskUser} !!!!!`)
       const riskData = await lendingPool.methods.getUserAccountData(riskUser).call()
+      console.log('got user data')
 
       // doing this for every liquidation attempt as rates will change after every successful liquidation (by this bot or others)
       const rates = {}
@@ -200,16 +213,21 @@ async function start() {
         if (token === 'celo') {
           rates["celo"] = BN(ether)
         } else {
-          // getting rates from sushiswap as a reference to check borrow positions later on
-          rates[token] = BN((await sushiSwap.methods.getAmountsOut(ether, [CELO.options.address, wrappedEth, tokens[token].options.address]).call())[2])
+          // making sure this is not an mc token
+          if (mctokens['m'+token]) {
+            // getting rates from sushiswap as a reference to check borrow positions later on
+            rates[token] = BN((await sushiSwap.methods.getAmountsOut(ether, [CELO.options.address, wrappedEth, tokens[token].options.address]).call())[2])
+          }
         }
       })
+      console.log('got rates')
 
       // building user positions for all tokens (perhpas get the list of user balances instead of getting the reserve data for all of them)
       const positions = await Promise.map(tokenNames, async (token) => {
         let pos = await dataProvider.methods.getUserReserveData(tokens[token].options.address, riskUser).call()
         return [token, pos]
       })
+      console.log('got positions')
 
       // for display only //////////////////////////////////
       const parsedData = {
@@ -294,14 +312,14 @@ async function start() {
           let ubeSwapBorrow = tokens[borrowToken]
           let swapPath
 
-          if (collateralToken !== 'celo' && tokens['m'+collateralToken]) {
+          if (collateralToken !== 'celo' && mctokens['m'+collateralToken]) {
             // switching to the mc token
-            ubeSwapCollateral = tokens['m'+collateralToken]
+            ubeSwapCollateral = mctokens['m'+collateralToken]
           }
 
-          if (borrowToken !== 'celo' && tokens['m'+borrowToken]) {
+          if (borrowToken !== 'celo' && mctokens['m'+borrowToken]) {
             // switching to the mc token
-            ubeSwapBorrow = tokens['m'+borrowToken]
+            ubeSwapBorrow = mctokens['m'+borrowToken]
           }
 
           // preparing ubeswap path (consider making the path longer in order to make the "deposit" redundent, need to check which cost is higher)
