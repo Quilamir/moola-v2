@@ -188,7 +188,6 @@ async function start() {
 
     // sorting to get riskiest on top
     const riskiest = usersData.sort(([a1, data1], [a2, data2]) => BN(data1.healthFactor).comparedTo(BN(data2.healthFactor)))
-    console.log(JSON.stringify(riskiest))
 
     // showing top 3 riskiest users (this is just for the logs)
     console.log(`Top 3 Riskiest users of ${riskiest.length}:`)
